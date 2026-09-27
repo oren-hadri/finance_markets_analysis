@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finance-markets-analysis"
+version = "0.1.0"
+description = "Tools for financial market data analysis"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas",
+    "yfinance",
+    "pandas-datareader",
+]
+
+[project.scripts]
+download-market-data = "data_downloader.downloader:main"
+
+[tool.setuptools]
+packages = ["config", "data_downloader"]
+
+[tool.setuptools.package-dir]
+config = "config"
+data_downloader = "src/data_downloader"
+
+[tool.setuptools.package-data]
+config = ["assets_list.ini"]

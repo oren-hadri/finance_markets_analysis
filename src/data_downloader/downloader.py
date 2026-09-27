@@ -1,118 +1,36 @@
 #!/usr/bin/env python3
 
-# NOTE: This script was generated with AI assistance and serves only as an
-# auxiliary data-download utility. It is not part of the academic submission.
-
-"""
-downloader.py
-=============
-Reads an INI file describing a universe of assets (crypto, traditional stocks,
-market indices, commodities, macro indicators) and downloads the last N days
-(default: 1 year) of historical data for each asset into CSV files.
-
-Data sources:
-  - crypto, traditional_stocks, market_indices, commodities -> Yahoo Finance (yfinance)
-  - macro_indicators                                        -> FRED (pandas_datareader)
-
-Design goals:
-  - Stable: retries with exponential backoff, per-asset isolation (one failure
-    never kills the run), rate-limiting between requests.
-  - Transparent: structured logging to console + log file, a final summary
-    report, and a machine-readable manifest of what succeeded/failed.
-  - Extensible: ticker/source mapping is centralized in a few dicts, so new
-    sections or symbols are easy to add without touching the core logic.
-
-Usage:
-    pip install -r requirements.txt
-    python downloader.py --config assets.ini --output-dir data --days 365
-
-Requires: yfinance, pandas, pandas_datareader
-"""
-
 from __future__ import annotations
 
 import argparse
 import configparser
 import csv
-import logging
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
+from utils.logger import setup_logging
+import pandas as pd
+import yfinance as yf
+from pandas_datareader import data as pdr
 
-# ---------------------------------------------------------------------------
-# Third-party imports are wrapped so we can fail with a clear, actionable
-# message instead of a raw ImportError/traceback if dependencies are missing.
-# ---------------------------------------------------------------------------
-try:
-    import pandas as pd
-except ImportError:
-    print("Missing dependency 'pandas'. Run: pip install -r requirements.txt")
-    sys.exit(1)
+# download raw data from yfinance and FRED (macro) sources, and write to CSV files
 
-try:
-    import yfinance as yf
-except ImportError:
-    print("Missing dependency 'yfinance'. Run: pip install -r requirements.txt")
-    sys.exit(1)
+# Load ticker and source mappings from the shared project configuration.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from pandas_datareader import data as pdr
-except ImportError:
-    pdr = None  # macro (FRED) downloads will be skipped with a warning
-
-# ---------------------------------------------------------------------------
-# Configuration: how to resolve each section's symbols to a real data source.
-# ---------------------------------------------------------------------------
-
-# Sections downloaded via Yahoo Finance and how to transform the INI key
-# into a real Yahoo ticker. `None` means "use the key as-is".
-YFINANCE_SECTIONS = {"crypto", "traditional_stocks", "market_indices", "commodities"}
-
-# Crypto tickers on Yahoo Finance need a "-USD" suffix (e.g. BTC -> BTC-USD).
-CRYPTO_SUFFIX = "-USD"
-
-# Market indices and commodities don't map 1:1 to their common short codes on
-# Yahoo Finance, so we maintain an explicit lookup table.
-INDEX_TICKER_MAP = {
-    "SPX": "^GSPC",
-    "DJI": "^DJI",
-    "IXIC": "^IXIC",
-    "RUT": "^RUT",
-    "VIX": "^VIX",
-    "FTSE": "^FTSE",
-    "N225": "^N225",
-    "GDAXI": "^GDAXI",
-    "HSI": "^HSI",
-}
-
-COMMODITY_TICKER_MAP = {
-    "XAU": "GC=F",  # Gold futures
-    "XAG": "SI=F",  # Silver futures
-    "CL": "CL=F",  # WTI crude futures
-    "BRENT": "BZ=F",  # Brent crude futures
-    "NG": "NG=F",  # Natural gas futures
-    "HG": "HG=F",  # Copper futures
-}
-
-# Macro indicators are pulled from FRED. Not every common macro code has a
-# clean FRED series; DXY has no reliable FRED series, so it is served via
-# Yahoo Finance instead as a documented exception.
-FRED_SERIES_MAP = {
-    "CPI": "CPIAUCSL",
-    "GDP": "GDP",
-    "UNRATE": "UNRATE",
-    "FEDFUNDS": "FEDFUNDS",
-    "US10Y": "DGS10",
-    "US2Y": "DGS2",
-    "PPI": "PPIACO",
-    "M2": "M2SL",
-}
-MACRO_YFINANCE_OVERRIDES = {
-    "DXY": "DX-Y.NYB",
-}
+from config.assets_configuration import (
+    COMMODITY_TICKER_MAP,
+    CRYPTO_SUFFIX,
+    FRED_SERIES_MAP,
+    INDEX_TICKER_MAP,
+    MACRO_YFINANCE_OVERRIDES,
+    YFINANCE_SECTIONS,
+)
 
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY_SECONDS = 2.0
@@ -145,24 +63,6 @@ class RunSummary:
     @property
     def failures(self):
         return [r for r in self.results if not r.ok]
-
-
-def setup_logging(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger("downloader")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    return logger
 
 
 def with_retries(fn: Callable, attempts: int, base_delay: float, logger: logging.Logger, label: str):
@@ -241,6 +141,24 @@ def download_yfinance(ticker: str, start: datetime, end: datetime) -> pd.DataFra
         raise ValueError("no data returned")
     return df
 
+def download_yfinance(ticker: str, start: datetime, end: datetime) -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    if df is None or df.empty:
+        raise ValueError("no data returned")
+
+    # yfinance return MultiIndex columns (price field, ticker, date) - so flatten it
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.index.name = "Date"
+
+    return df
 
 def download_fred(series: str, start: datetime, end: datetime) -> pd.DataFrame:
     if pdr is None:
@@ -306,9 +224,9 @@ def write_manifest(summary: RunSummary, output_dir: Path) -> Path:
 # Anchor default paths to this script's own location (not the current working
 # directory), so `assets.ini` / `data` are always found relative to the
 # project folder regardless of where the script is invoked from.
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "config" / "assets_list.ini"
-DEFAULT_OUTPUT_DIR = PROJECT_DIR / "data"
+DEFAULT_OUTPUT_DIR = PROJECT_DIR / "data/raw"
 
 
 def main() -> int:
@@ -323,7 +241,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger = setup_logging(output_dir / "downloader.log")
+    logger = setup_logging(output_dir / "downloader.log", "downloader")
 
     end = datetime.now()
     start = end - timedelta(days=args.days)
