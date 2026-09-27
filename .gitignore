@@ -1,0 +1,9 @@
+# IDE / editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Recorded market data
+/data/
