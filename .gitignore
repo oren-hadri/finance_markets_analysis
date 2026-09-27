@@ -4,6 +4,7 @@
 *.swp
 *.swo
 .DS_Store
+*.log
 
 # Recorded market data
 /data/
