@@ -188,8 +188,8 @@ def plot_all_global_metrics():
   df["Date"] = pd.to_datetime(df["Date"])
   df = df.sort_values("Date")
 
-  # Create a figure with 4 subplots for different metrics
-  fig, axes = plt.subplots(nrows=4, ncols=1, figsize=(12, 14), sharex=True)
+  # Create a figure with four network metrics and a normalized market comparison.
+  fig, axes = plt.subplots(nrows=5, ncols=1, figsize=(12, 17), sharex=True)
 
   # 1. Edges and Density
   axes[0].plot(
@@ -249,6 +249,41 @@ def plot_all_global_metrics():
   axes[3].set_ylabel("Clustering Coeff", color="tab:orange")
   axes[3].tick_params(axis="y", labelcolor="tab:orange")
   axes[3].grid(True, linestyle="--", alpha=0.6)
+
+  # 5. Bitcoin and S&P 500, each rebased to 100 at its first available price.
+  levels_file = PROJECT_DIR / "data/normalized/merged_levels.csv"
+  if levels_file.exists():
+    levels_df = pd.read_csv(levels_file, parse_dates=["date"]).sort_values("date")
+    market_columns = {
+        "crypto__BTC": "Bitcoin",
+        "market_indices__SPX": "S&P 500",
+    }
+    for column, label in market_columns.items():
+      if column not in levels_df.columns:
+        continue
+      prices = pd.to_numeric(levels_df[column], errors="coerce")
+      first_valid = prices.dropna()
+      if first_valid.empty or first_valid.iloc[0] == 0:
+        continue
+      normalized_prices = prices / first_valid.iloc[0] * 100
+      axes[4].plot(levels_df["date"], normalized_prices, label=label)
+
+    if axes[4].lines:
+      axes[4].legend()
+    else:
+      axes[4].text(
+          0.5, 0.5, "Bitcoin and S&P 500 price data unavailable",
+          ha="center", va="center", transform=axes[4].transAxes,
+      )
+  else:
+    axes[4].text(
+        0.5, 0.5, f"Price data file not found: {levels_file}",
+        ha="center", va="center", transform=axes[4].transAxes,
+    )
+  axes[4].set_ylabel("Index (base = 100)")
+  axes[4].set_xlabel("Date")
+  axes[4].grid(True, linestyle="--", alpha=0.6)
+  axes[4].set_title("Bitcoin and S&P 500 (Normalized)")
 
   plt.tight_layout()
 
