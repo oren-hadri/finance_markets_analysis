@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
-
-
 """
 prepare_data.py
 ================
-in this file we will load the raw data and prepare it for analysis
-we will convert the 'price' value into logarithmic price change.
-script will also report missing/broken files, and merges everything into single dataset.
+Load the raw per-asset CSVs (yfinance-style OHLCV for crypto/stocks/indices/
+commodities, single-value FRED series for macro indicators), and prepare a
+merged, daily-aligned dataset for downstream graph/GNN analysis.
+
+For every asset we now extract, when available:
+  - close   -> used for levels + log return + RSI-14
+  - high/low -> used together with close for ATR-14
+  - volume  -> used for a rolling volume z-score
+
+Non-trading days (e.g. weekends for stocks, market holidays) are forward-
+filled for price (the market is closed, price didn't move) but set to 0 for
+volume (no trading happened - carrying the last volume forward would be a
+fabricated number).
+
+Outputs:
+  merged_levels.csv   - ffilled Close, one column per asset
+  merged_returns.csv  - log return of levels, one column per asset
+  merged_rsi.csv      - Wilder's RSI-14 (only for assets with OHLC)
+  merged_atr.csv      - ATR-14, normalized by close (only for assets with OHLC)
+  merged_volume.csv   - rolling 20d z-score of volume (only for assets with volume)
+  prep_report.csv     - per-asset status report (ok/missing/failed, has_ohlc)
 """
 
 from __future__ import annotations
@@ -14,9 +30,12 @@ from __future__ import annotations
 import argparse
 import configparser
 import csv
-from dataclasses import dataclass
+import logging
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import numpy as np
 import pandas as pd
 
 from utils.logger import setup_logging
@@ -27,11 +46,9 @@ DEFAULT_CONFIG_PATH = PROJECT_DIR / "config" / "assets_list.ini"
 DEFAULT_DATA_DIR = PROJECT_DIR / "data/raw"
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "data/normalized"
 
-# Sections whose native reporting frequency is coarser than daily. Used only
-# as a sensible fallback when frequency can't be inferred directly from the
-# data's own date spacing.
-KNOWN_MONTHLY_SECTIONS_HINT = {"CPI", "UNRATE", "FEDFUNDS", "PPI", "M2"}
-KNOWN_QUARTERLY_SECTIONS_HINT = {"GDP"}
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOLUME_ZSCORE_WINDOW = 20
 
 
 @dataclass
@@ -43,7 +60,12 @@ class AssetStatus:
     detail: str = ""
     frequency: str = ""
     rows: int = 0
+    has_ohlc: bool = False
 
+
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
 def parse_config(config_path: Path) -> configparser.ConfigParser:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -62,36 +84,52 @@ def load_asset_csv(path: Path) -> pd.DataFrame:
     return df
 
 
-def extract_value_series(df: pd.DataFrame, symbol: str) -> pd.Series:
+# ------------------------------------------------------------------
+# Extraction: now pulls Close/High/Low/Volume, not just Close
+# ------------------------------------------------------------------
+def extract_asset_frame(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """
-    Reduce a raw downloaded DataFrame to a single representative series:
-      - price-type data (yfinance) -> 'Close' if present, else first numeric column
-      - macro data (FRED)          -> its single value column
+    Reduce a raw downloaded DataFrame to a small, standardized frame:
+      - price-type data (yfinance): columns close/high/low/volume (whichever exist)
+        prefers 'Adj Close' for 'close' when present (splits/dividends adjusted),
+        falls back to 'Close'.
+      - macro data (FRED): single column, renamed to 'close' so downstream code
+        (returns, etc.) can treat it uniformly. No high/low/volume.
     """
-    if "Close" in df.columns:
-        series = df["Close"]
+    cols = {c.lower(): c for c in df.columns}
+    out = pd.DataFrame(index=df.index)
+
+    if "close" in cols or "adj close" in cols:
+        close_col = cols.get("adj close", cols.get("close"))
+        out["close"] = df[close_col]
+        if "high" in cols:
+            out["high"] = df[cols["high"]]
+        if "low" in cols:
+            out["low"] = df[cols["low"]]
+        if "volume" in cols:
+            out["volume"] = df[cols["volume"]]
     else:
+        # macro / FRED: single numeric value column
         numeric_cols = df.select_dtypes(include="number").columns
         if len(numeric_cols) == 0:
             raise ValueError("no numeric column found to extract")
-        series = df[numeric_cols[0]]
+        out["close"] = df[numeric_cols[0]]
 
-    series = series.dropna()
-    if series.empty:
+    out = out.dropna(subset=["close"])
+    if out.empty:
         raise ValueError("value column is entirely empty after dropping NaNs")
 
     # Normalize the index: drop timezone (yfinance often returns tz-aware
-    # timestamps; FRED does not), and truncate to calendar date only so the
-    # two sources align cleanly when merged.
-    idx = pd.DatetimeIndex(series.index)
+    # timestamps; FRED does not), and truncate to calendar date only so
+    # sources align cleanly when merged.
+    idx = pd.DatetimeIndex(out.index)
     if idx.tz is not None:
         idx = idx.tz_localize(None)
-    series.index = idx.normalize()
-    series.name = symbol
-    return series
+    out.index = idx.normalize()
+    return out
 
 
-def detect_frequency(series: pd.Series, symbol: str) -> str:
+def detect_frequency(series: pd.Series) -> str:
     """Best-effort frequency label, used only for reporting (not for logic)."""
     if len(series) < 2:
         return "unknown"
@@ -114,9 +152,9 @@ def detect_frequency(series: pd.Series, symbol: str) -> str:
 
 def collect_assets(
     config: configparser.ConfigParser, data_dir: Path, logger: logging.Logger
-) -> tuple[list[AssetStatus], dict[str, pd.Series]]:
+) -> tuple[list[AssetStatus], dict[str, pd.DataFrame]]:
     statuses: list[AssetStatus] = []
-    series_by_key: dict[str, pd.Series] = {}
+    frames_by_key: dict[str, pd.DataFrame] = {}
 
     for section in config.sections():
         for symbol, name in config.items(section):
@@ -130,55 +168,105 @@ def collect_assets(
 
             try:
                 raw = load_asset_csv(csv_path)
-                series = extract_value_series(raw, symbol)
-                freq = detect_frequency(series, symbol)
+                frame = extract_asset_frame(raw, symbol)
+                has_ohlc = "high" in frame.columns and "low" in frame.columns
+                freq = detect_frequency(frame["close"])
                 key = f"{section}__{symbol}"
-                series_by_key[key] = series
-                statuses.append(AssetStatus(section, symbol, name, "ok", frequency=freq, rows=len(series)))
-                logger.info("%s: OK (%d rows, freq=%s)", label, len(series), freq)
+                frames_by_key[key] = frame
+                statuses.append(AssetStatus(section, symbol, name, "ok", frequency=freq, rows=len(frame), has_ohlc=has_ohlc))
+                logger.info("%s: OK (%d rows, freq=%s, ohlc=%s)", label, len(frame), freq, has_ohlc)
             except Exception as exc:  # noqa: BLE001
                 logger.error("%s: FAILED to prepare (%s) - needs fixing", label, exc)
                 statuses.append(AssetStatus(section, symbol, name, "failed", detail=str(exc)))
 
-    return statuses, series_by_key
+    return statuses, frames_by_key
 
 
-def build_merged_datasets(series_by_key: dict[str, pd.Series], logger: logging.Logger):
-    if not series_by_key:
-        raise ValueError("no valid asset series available to merge")
+# ------------------------------------------------------------------
+# Technical indicators (computed per-asset, on its own native calendar,
+# BEFORE reindexing onto the common calendar)
+# ------------------------------------------------------------------
+def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    # Wilder's smoothing (equivalent to an EMA with alpha = 1/period)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)  # neutral where undefined (e.g. no losses in the window yet)
 
-    all_starts = [s.index.min() for s in series_by_key.values()]
-    all_ends = [s.index.max() for s in series_by_key.values()]
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ATR_PERIOD) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    # normalize by price level so ATR is comparable across assets of very
+    # different price scales (e.g. BTC at $60k vs a $5 altcoin)
+    return atr / close
+
+
+# ------------------------------------------------------------------
+# Merge onto a common daily calendar
+# ------------------------------------------------------------------
+def build_merged_datasets(frames_by_key: dict[str, pd.DataFrame], logger: logging.Logger):
+    if not frames_by_key:
+        raise ValueError("no valid asset data available to merge")
+
+    all_starts = [f.index.min() for f in frames_by_key.values()]
+    all_ends = [f.index.max() for f in frames_by_key.values()]
     full_range = pd.date_range(start=min(all_starts), end=max(all_ends), freq="D")
     logger.info("Common daily calendar: %s -> %s (%d days)", full_range.min().date(), full_range.max().date(), len(full_range))
 
     levels = pd.DataFrame(index=full_range)
-    for key, series in series_by_key.items():
-        # Reindex onto the common daily calendar, then forward-fill: this
-        # carries the last KNOWN value forward (e.g. a monthly CPI print
-        # holds until the next print), and never fabricates future data.
-        levels[key] = series.reindex(full_range).ffill()
+    returns = pd.DataFrame(index=full_range)
+    rsi_df = pd.DataFrame(index=full_range)
+    atr_df = pd.DataFrame(index=full_range)
+    volume_df = pd.DataFrame(index=full_range)
 
-    levels.index.name = "date"
+    for key, frame in frames_by_key.items():
+        has_ohlc = "high" in frame.columns and "low" in frame.columns
 
-    # Simple period-over-period percentage change on the forward-filled
-    # levels. For daily assets this is a normal daily return; for
-    # monthly/quarterly macro series it will mostly read 0% between prints
-    # and jump on the day a new figure is carried in - which is expected and
-    # should be interpreted with that in mind, not treated as a daily return.
-    returns = levels.pct_change()
-    returns.index.name = "date"
+        # --- indicators computed on the asset's OWN calendar first ---
+        rsi_native = compute_rsi(frame["close"]) if has_ohlc else None
+        atr_native = compute_atr(frame["high"], frame["low"], frame["close"]) if has_ohlc else None
 
-    return levels, returns
+        # --- price: reindex onto common calendar, then ffill (market closed
+        #     -> price unchanged) ---
+        close_full = frame["close"].reindex(full_range).ffill()
+        levels[key] = close_full
+        returns[key] = np.log(close_full / close_full.shift(1))
+
+        if has_ohlc:
+            rsi_df[key] = rsi_native.reindex(full_range).ffill()
+            atr_df[key] = atr_native.reindex(full_range).ffill()
+
+        # --- volume: reindex onto common calendar, but fill non-trading
+        #     days with 0 (no trading happened), never ffill ---
+        if "volume" in frame.columns:
+            vol_full = frame["volume"].reindex(full_range).fillna(0)
+            vol_mean = vol_full.rolling(VOLUME_ZSCORE_WINDOW).mean()
+            vol_std = vol_full.rolling(VOLUME_ZSCORE_WINDOW).std()
+            volume_df[key] = (vol_full - vol_mean) / vol_std.replace(0, np.nan)
+
+    for d in (levels, returns, rsi_df, atr_df, volume_df):
+        d.index.name = "date"
+
+    return levels, returns, rsi_df, atr_df, volume_df
 
 
 def write_report(statuses: list[AssetStatus], output_dir: Path) -> Path:
     report_path = output_dir / "prep_report.csv"
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["section", "symbol", "name", "status", "frequency", "rows", "detail"])
+        writer.writerow(["section", "symbol", "name", "status", "frequency", "rows", "has_ohlc", "detail"])
         for s in statuses:
-            writer.writerow([s.section, s.symbol, s.name, s.status, s.frequency, s.rows, s.detail])
+            writer.writerow([s.section, s.symbol, s.name, s.status, s.frequency, s.rows, s.has_ohlc, s.detail])
     return report_path
 
 
@@ -206,7 +294,7 @@ def main() -> int:
         return 1
 
     logger.info("Checking config '%s' against data in '%s'", args.config, data_dir)
-    statuses, series_by_key = collect_assets(config, data_dir, logger)
+    statuses, frames_by_key = collect_assets(config, data_dir, logger)
 
     ok = [s for s in statuses if s.status == "ok"]
     missing = [s for s in statuses if s.status == "missing"]
@@ -222,25 +310,29 @@ def main() -> int:
     report_path = write_report(statuses, output_dir)
     logger.info("Per-asset report written to: %s", report_path)
 
-    if not series_by_key:
+    if not frames_by_key:
         logger.error("No valid data available to merge. Fix the assets listed above and re-run downloader.py.")
         return 2
 
     try:
-        levels, returns = build_merged_datasets(series_by_key, logger)
+        levels, returns, rsi_df, atr_df, volume_df = build_merged_datasets(frames_by_key, logger)
     except Exception as exc:
         logger.error("Failed to build merged dataset: %s", exc)
         return 2
 
-    levels_path = output_dir / "merged_levels.csv"
-    returns_path = output_dir / "merged_returns.csv"
-    levels.to_csv(levels_path)
-    returns.to_csv(returns_path)
+    outputs = {
+        "merged_levels.csv": levels,
+        "merged_returns.csv": returns,
+        "merged_rsi.csv": rsi_df,
+        "merged_atr.csv": atr_df,
+        "merged_volume.csv": volume_df,
+    }
+    for filename, data in outputs.items():
+        path = output_dir / filename
+        data.to_csv(path)
+        logger.info("%-20s -> %s (%d rows, %d columns)", filename, path, *data.shape)
 
-    logger.info("Merged levels (ffilled, daily)   -> %s (%d rows, %d columns)", levels_path, *levels.shape)
-    logger.info("Merged returns (pct change)      -> %s (%d rows, %d columns)", returns_path, *returns.shape)
     logger.info("Done.")
-
     return 0 if not (missing or failed) else 2
 
 

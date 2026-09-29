@@ -2,3 +2,7 @@ yfinance
 pandas
 pandas_datareader
 matplotlib
+networkx
+scipy
+networkx
+python-louvain
