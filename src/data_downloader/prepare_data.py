@@ -2,27 +2,13 @@
 """
 prepare_data.py
 ================
-Load the raw per-asset CSVs (yfinance-style OHLCV for crypto/stocks/indices/
-commodities, single-value FRED series for macro indicators), and prepare a
-merged, daily-aligned dataset for downstream graph/GNN analysis.
-
-For every asset we now extract, when available:
-  - close   -> used for levels + log return + RSI-14
-  - high/low -> used together with close for ATR-14
-  - volume  -> used for a rolling volume z-score
-
-Non-trading days (e.g. weekends for stocks, market holidays) are forward-
-filled for price (the market is closed, price didn't move) but set to 0 for
-volume (no trading happened - carrying the last volume forward would be a
-fabricated number).
-
+Each file is downloaded into a ‘raw’ recorded data file,  each row contains: Date,Adj Close,Close,High,Low,Open,Volume
+We load the raw per-asset CSVs and prepare a merged, daily-aligned dataset.  Non-trading days (e.g. weekends for stocks, market holidays) are forward- filled for price (the market is closed, price didn't move) but set to 0 for volume (no trading happened).
 Outputs:
-  merged_levels.csv   - ffilled Close, one column per asset
-  merged_returns.csv  - log return of levels, one column per asset
-  merged_rsi.csv      - Wilder's RSI-14 (only for assets with OHLC)
-  merged_atr.csv      - ATR-14, normalized by close (only for assets with OHLC)
-  merged_volume.csv   - rolling 20d z-score of volume (only for assets with volume)
-  prep_report.csv     - per-asset status report (ok/missing/failed, has_ohlc)
+merged_levels.csv   -  Close, one column per asset
+merged_returns.csv  - log return of levels, one column per asset   merged_rsi.csv      - Wilder's RSI-14 (only for assets with OHLC)   merged_atr.csv      - ATR-14, normalized by close (only for assets with OHLC)
+merged_volume.csv   - rolling 20d z-score of volume (only for assets with volume)
+prep_report.csv     - per-asset status report (ok/missing/failed, has_ohlc)
 """
 
 from __future__ import annotations

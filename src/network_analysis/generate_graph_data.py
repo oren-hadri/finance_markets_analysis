@@ -1,13 +1,16 @@
 from pathlib import Path
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 import scipy
 from matplotlib import pyplot as plt
+from scipy import stats
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "data/normalized"
-
+filter_name = "all"  # Options: 'all', 'crypto_only', 'non_crypto'
 
 def generate_graph_date():
 
@@ -16,8 +19,8 @@ def generate_graph_date():
   # Load the generated log returns dataset
   returns_df = pd.read_csv(data_file, index_col=0, parse_dates=True)
 
-  window_size = 60
-  step_size = 60  # You can change step size (e.g., every 20 days or every 1 day)
+  window_size = 30
+  step_size = 30  # You can change step size (e.g., every 20 days or every 1 day)
 
   for start_idx in range(0, len(returns_df) - window_size + 1, step_size):
     end_idx = start_idx + window_size
@@ -36,11 +39,15 @@ def generate_graph_date():
     G = nx.Graph()
     for i in range(len(corr_matrix.columns)):
       for j in range(i + 1, len(corr_matrix.columns)):
-        weight = corr_matrix.iloc[i, j]
-        if weight >= threshold:
-          G.add_edge(
-            corr_matrix.columns[i], corr_matrix.columns[j], weight=weight
-          )
+          corr = corr_matrix.iloc[i, j]
+          if abs(corr) >= threshold:
+              G.add_edge(
+                  corr_matrix.columns[i],
+                  corr_matrix.columns[j],
+                  weight=abs(corr),
+                  corr=corr,
+                  distance=np.sqrt(max(0.0, 2 * (1 - abs(corr)))),# strong correlation = short distance - need to convert the sizes
+              )
 
     # Export edges for this specific window
     if len(G.edges) > 0:
@@ -72,7 +79,7 @@ def analyze_graph(G):
 
     # Build the graph for this specific month
     G = nx.from_pandas_edgelist(
-      edges_df, source="source", target="target", edge_attr="weight"
+      edges_df, source="source", target="target", edge_attr=["weight", "distance"]
     )
 
     # Skip empty graphs
@@ -81,8 +88,8 @@ def analyze_graph(G):
 
     # Calculate metrics for this specific month
     degree_cent = nx.degree_centrality(G)
-    betweenness_cent = nx.betweenness_centrality(G, weight="weight")
-    pagerank_cent = nx.pagerank(G, weight="weight")
+    betweenness_cent = nx.betweenness_centrality(G, weight="distance") # distance == weak correlation
+    pagerank_cent = nx.pagerank(G, weight="weight") # importance == strong correlation
 
     # Store metrics per asset, including the month/time column
     for node in G.nodes():
@@ -119,12 +126,25 @@ def generate_global_metrics():
     window_date = file_path.stem.replace("edges_window_", "")
     edges_df = pd.read_csv(file_path)
 
+    # Filter edges
+    if filter_name == 'crypto_only':
+        edges_df = edges_df[
+            edges_df["source"].astype(str).str.startswith("crypto_") &
+            edges_df["target"].astype(str).str.startswith("crypto_")
+            ]
+    if filter_name == 'non_crypto':
+        edges_df = edges_df[
+            ~edges_df["source"].astype(str).str.startswith("crypto_") &
+            ~edges_df["target"].astype(str).str.startswith("crypto_")
+            ]
+
+
     if edges_df.empty:
       continue
 
     # Build graph from edges
     G = nx.from_pandas_edgelist(
-        edges_df, source="source", target="target", edge_attr="weight"
+        edges_df, source="source", target="target", edge_attr=["weight", "distance"]
     )
 
     if len(G.nodes) == 0:
@@ -132,16 +152,16 @@ def generate_global_metrics():
 
     # 1. Global Network Metrics
     density = nx.density(G)
-    clustering = nx.average_clustering(G, weight="weight")
+    clustering = nx.average_clustering(G, weight="weight") # strong correlation = high clustering
 
     # Handle shortest path length safely (only if graph or its largest component is connected)
     if nx.is_connected(G):
-      path_length = nx.average_shortest_path_length(G, weight="weight")
+      path_length = nx.average_shortest_path_length(G, weight="distance")
     else:
       largest_cc = max(nx.connected_components(G), key=len)
       subgraph = G.subgraph(largest_cc)
       path_length = (
-          nx.average_shortest_path_length(subgraph, weight="weight")
+          nx.average_shortest_path_length(subgraph, weight="distance")
           if len(subgraph) > 1
           else 0.0
       )
@@ -288,7 +308,7 @@ def plot_all_global_metrics():
   plt.tight_layout()
 
   output_path = (
-      PROJECT_DIR / "data/graph/visualizations/comprehensive_global_metrics.png"
+      PROJECT_DIR / f"data/visualizations/{filter_name}_comprehensive_global_metrics.png"
   )
   output_path.parent.mkdir(parents=True, exist_ok=True)
   plt.savefig(output_path, dpi=300)
@@ -296,8 +316,43 @@ def plot_all_global_metrics():
   print(f"Comprehensive metrics plot saved successfully to: {output_path}")
 
 
+def compare_local_centrality_insights(top_n=3):
+    csv_file = PROJECT_DIR / "data/graph" / "nodes_centrality_timeseries.csv"
+    if not csv_file.exists():
+        print(f"File not found: {csv_file}")
+        return
+
+    df = pd.read_csv(csv_file)
+    df = df[~df["Asset"].str.startswith(("market_indices__", "macro_indicators__"))]
+
+    # Average per asset across time
+    avg = df.groupby("Asset")[["Degree_Centrality", "PageRank", "Betweenness_Centrality"]].mean()
+    crypto = avg[avg.index.str.startswith("crypto_")]
+    tradfi = avg[~avg.index.str.startswith("crypto_")]
+
+    # 1. Degree dispersion
+    _, p = stats.levene(tradfi["Degree_Centrality"], crypto["Degree_Centrality"])
+    print("1. Degree Std: TradFi=%.4f, Crypto=%.4f (Levene p=%.2f -> %s)" % (
+        tradfi["Degree_Centrality"].std(),
+        crypto["Degree_Centrality"].std(),
+        p,
+        "similar" if p >= 0.05 else "different",
+    ))
+
+    # 2. Top drivers and 3. Top bridges
+    for title, col in [("2. Top PageRank", "PageRank"), ("3. Top Betweenness", "Betweenness_Centrality")]:
+        print(f"\n{title}:")
+        print("  TradFi:", ", ".join(tradfi[col].nlargest(top_n).index))
+        print("  Crypto:", ", ".join(crypto[col].nlargest(top_n).index))
+        print(f"  Mean: TradFi={tradfi[col].mean():.4f}, Crypto={crypto[col].mean():.4f}")
+
 if __name__ == '__main__':
-    generate_graph_date()
-    analyze_graph(None)  # Pass None since we are reading from files
-    generate_global_metrics()
+    recalculate = False
+    if recalculate:
+        generate_graph_date()
+        analyze_graph(None)  # Pass None since we are reading from files
+        generate_global_metrics()
     plot_all_global_metrics()
+
+    compare_local_centrality_insights()
+
