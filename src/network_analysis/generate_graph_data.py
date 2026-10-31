@@ -3,356 +3,337 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 import pandas as pd
-import scipy
 from matplotlib import pyplot as plt
 from scipy import stats
 
-
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "data/normalized"
-filter_name = "all"  # Options: 'all', 'crypto_only', 'non_crypto'
 
-def generate_graph_date():
+# Options: 'all', 'crypto_only', 'non_crypto'
+GROUPS = ["all", "crypto_only", "non_crypto"]
 
-  data_file = DEFAULT_OUTPUT_DIR / "merged_returns.csv"
+WINDOW_SIZE = 30
+STEP_SIZE = 30
+THRESHOLD = 0.4
 
-  # Load the generated log returns dataset
-  returns_df = pd.read_csv(data_file, index_col=0, parse_dates=True)
 
-  window_size = 30
-  step_size = 30  # You can change step size (e.g., every 20 days or every 1 day)
+def graph_dir(group):
+    # Each group has its own folder, so results do not overwrite each other
+    folder = PROJECT_DIR / "data/graph" / group
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
-  for start_idx in range(0, len(returns_df) - window_size + 1, step_size):
-    end_idx = start_idx + window_size
 
-    # Slice the rolling window
-    window_returns = returns_df.iloc[start_idx:end_idx]
+def filter_assets(columns, group):
+    is_crypto = columns.str.startswith("crypto_")
+    if group == "crypto_only":
+        return columns[is_crypto]
+    if group == "non_crypto":
+        return columns[~is_crypto]
+    return columns
 
-    # Get the date label for saving files (using the last date in the window)
-    window_date = window_returns.index[-1].strftime("%Y-%m-%d")
 
-    # Compute correlation matrix for this window
-    corr_matrix = window_returns.corr()
+def build_graph(corr_matrix, threshold):
+    names = list(corr_matrix.columns)
+    values = corr_matrix.to_numpy()
 
-    # Build graph
-    threshold = 0.4
     G = nx.Graph()
-    for i in range(len(corr_matrix.columns)):
-      for j in range(i + 1, len(corr_matrix.columns)):
-          corr = corr_matrix.iloc[i, j]
-          if abs(corr) >= threshold:
-              G.add_edge(
-                  corr_matrix.columns[i],
-                  corr_matrix.columns[j],
-                  weight=abs(corr),
-                  corr=corr,
-                  distance=np.sqrt(max(0.0, 2 * (1 - abs(corr)))),# strong correlation = short distance - need to convert the sizes
-              )
+    # Keep all assets as nodes, even if they have no edges
+    G.add_nodes_from(names)
 
-    # Export edges for this specific window
-    if len(G.edges) > 0:
-      edges_df = nx.to_pandas_edgelist(G)
-      edges_df.to_csv(
-        PROJECT_DIR / "data/graph" / f"edges_window_{window_date}.csv",
-        index=False,
-      )
-
-  # Create the nodes table with basic info (e.g., asset identifier)
-  #nodes_df = pd.DataFrame({"id": list(G.nodes())})
-  #nodes_df.to_csv("cytoscape_nodes.csv", index=False)
-
-  print("Graph data generated successfully!")
-
-def analyze_graph(G):
-  # Assume we have monthly returns or we slice the data into monthly windows
-  # For example, iterating over monthly edge files or running over rolling windows:
-
-  timeseries_metrics = []
-
-  # If you have multiple monthly edge files or want to loop through rolling windows:
-  # Let's assume we loop through files saved for each month:
-  for file_path in sorted(
-          (PROJECT_DIR / "data/graph").glob("edges_window_*.csv")
-  ):
-    month_name = file_path.stem.replace("edges_window_", "")
-    edges_df = pd.read_csv(file_path)
-
-    # Build the graph for this specific month
-    G = nx.from_pandas_edgelist(
-      edges_df, source="source", target="target", edge_attr=["weight", "distance"]
-    )
-
-    # Skip empty graphs
-    if len(G.nodes) == 0:
-      continue
-
-    # Calculate metrics for this specific month
-    degree_cent = nx.degree_centrality(G)
-    betweenness_cent = nx.betweenness_centrality(G, weight="distance") # distance == weak correlation
-    pagerank_cent = nx.pagerank(G, weight="weight") # importance == strong correlation
-
-    # Store metrics per asset, including the month/time column
-    for node in G.nodes():
-      timeseries_metrics.append({
-        "Month": month_name,
-        "Asset": node,
-        "Degree_Centrality": degree_cent[node],
-        "Betweenness_Centrality": betweenness_cent[node],
-        "PageRank": pagerank_cent[node],
-      })
-
-  # Combine everything into a grand time-series DataFrame
-  ts_metrics_df = pd.DataFrame(timeseries_metrics)
-
-  # Save the timeline metrics (ideal for tracking how asset centrality changes over 4 years!)
-  ts_metrics_df.to_csv(
-    PROJECT_DIR / "data/graph" / "nodes_centrality_timeseries.csv", index=False
-  )
-  print(
-    "Time-series node metrics calculated and saved successfully for all"
-    " months!"
-  )
-
-def generate_global_metrics():
-  edge_files = sorted(list((PROJECT_DIR/ "data/graph").glob("edges_window_*.csv")))
-
-  if not edge_files:
-    print("No edge files found. Please generate the graph data first.")
-    return
-
-  global_metrics = []
-
-  for file_path in edge_files:
-    window_date = file_path.stem.replace("edges_window_", "")
-    edges_df = pd.read_csv(file_path)
-
-    # Filter edges
-    if filter_name == 'crypto_only':
-        edges_df = edges_df[
-            edges_df["source"].astype(str).str.startswith("crypto_") &
-            edges_df["target"].astype(str).str.startswith("crypto_")
-            ]
-    if filter_name == 'non_crypto':
-        edges_df = edges_df[
-            ~edges_df["source"].astype(str).str.startswith("crypto_") &
-            ~edges_df["target"].astype(str).str.startswith("crypto_")
-            ]
+    rows, cols = np.triu_indices(len(names), k=1)
+    for i, j in zip(rows, cols):
+        corr = values[i, j]
+        # A NaN correlation fails this check, so no edge is created
+        if abs(corr) >= threshold:
+            G.add_edge(
+                names[i],
+                names[j],
+                weight=abs(corr),
+                corr=corr,
+                # Strong correlation = short distance
+                distance=np.sqrt(max(0.0, 2 * (1 - abs(corr)))),
+            )
+    return G
 
 
-    if edges_df.empty:
-      continue
+def generate_graph_date(group, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
+                        threshold=THRESHOLD):
+    data_file = DEFAULT_OUTPUT_DIR / "merged_returns.csv"
+    returns_df = pd.read_csv(data_file, index_col=0, parse_dates=True)
 
-    # Build graph from edges
-    G = nx.from_pandas_edgelist(
-        edges_df, source="source", target="target", edge_attr=["weight", "distance"]
-    )
+    # Choose the assets first, then compute the correlations
+    returns_df = returns_df[filter_assets(returns_df.columns, group)]
 
-    if len(G.nodes) == 0:
-      continue
+    folder = graph_dir(group)
 
-    # 1. Global Network Metrics
-    density = nx.density(G)
-    clustering = nx.average_clustering(G, weight="weight") # strong correlation = high clustering
+    for start_idx in range(0, len(returns_df) - window_size + 1, step_size):
+        window_returns = returns_df.iloc[start_idx:start_idx + window_size]
 
-    # Handle shortest path length safely (only if graph or its largest component is connected)
-    if nx.is_connected(G):
-      path_length = nx.average_shortest_path_length(G, weight="distance")
+        # The last date of the window is used as the file name
+        window_date = window_returns.index[-1].strftime("%Y-%m-%d")
+
+        corr_matrix = window_returns.corr()
+        G = build_graph(corr_matrix, threshold)
+
+        # Save the node list, so assets without edges are not lost
+        pd.DataFrame({"id": list(G.nodes())}).to_csv(
+            folder / f"nodes_window_{window_date}.csv", index=False
+        )
+
+        if G.number_of_edges() > 0:
+            nx.to_pandas_edgelist(G).to_csv(
+                folder / f"edges_window_{window_date}.csv", index=False
+            )
+
+    print(f"[{group}] Graph data generated successfully!")
+
+
+def load_window_graph(folder, window_date):
+    nodes = pd.read_csv(folder / f"nodes_window_{window_date}.csv")["id"]
+
+    edge_file = folder / f"edges_window_{window_date}.csv"
+    if edge_file.exists():
+        edges_df = pd.read_csv(edge_file)
+        G = nx.from_pandas_edgelist(
+            edges_df, source="source", target="target",
+            edge_attr=["weight", "distance"],
+        )
     else:
-      largest_cc = max(nx.connected_components(G), key=len)
-      subgraph = G.subgraph(largest_cc)
-      path_length = (
-          nx.average_shortest_path_length(subgraph, weight="distance")
-          if len(subgraph) > 1
-          else 0.0
-      )
+        G = nx.Graph()
 
-    # 2. Community Detection using NetworkX built-in Greedy Modularity
-    try:
-      communities = nx.community.greedy_modularity_communities(
-          G, weight="weight"
-      )
-      num_communities = len(communities)
-      # Calculate modularity using built-in function
-      modularity = nx.community.modularity(
-          G, communities, weight="weight"
-      )
-    except Exception:
-      num_communities = 1
-      modularity = 0.0
+    G.add_nodes_from(nodes)
+    return G
 
-    # Store metrics for this window
-    global_metrics.append({
-        "Date": window_date,
-        "Nodes_Count": len(G.nodes),
-        "Edges_Count": len(G.edges),
-        "Density": density,
-        "Clustering_Coefficient": clustering,
-        "Avg_Path_Length": path_length,
-        "Modularity": modularity,
-        "Num_Communities": num_communities,
-    })
 
-  # Save to CSV
-  output_file = PROJECT_DIR / "data/graph" / "global_network_metrics.csv"
-  pd.DataFrame(global_metrics).to_csv(output_file, index=False)
-  print(f"Global network metrics successfully saved to: {output_file}")
+def window_dates(folder):
+    files = sorted(folder.glob("nodes_window_*.csv"))
+    return [f.stem.replace("nodes_window_", "") for f in files]
 
-def plot_all_global_metrics():
-  METRICS_FILE = PROJECT_DIR / "data/graph/global_network_metrics.csv"
 
-  if not METRICS_FILE.exists():
-    print(f"Metrics file not found at: {METRICS_FILE}")
-    return
+def analyze_graph(group):
+    folder = graph_dir(group)
+    rows = []
 
-  df = pd.read_csv(METRICS_FILE)
-  df["Date"] = pd.to_datetime(df["Date"])
-  df = df.sort_values("Date")
+    for window_date in window_dates(folder):
+        G = load_window_graph(folder, window_date)
 
-  # Create a figure with four network metrics and a normalized market comparison.
-  fig, axes = plt.subplots(nrows=5, ncols=1, figsize=(12, 17), sharex=True)
+        if len(G.nodes) == 0:
+            continue
 
-  # 1. Edges and Density
-  axes[0].plot(
-      df["Date"],
-      df["Edges_Count"],
-      color="tab:blue",
-      marker="o",
-      label="Edges Count",
-  )
-  axes[0].set_ylabel("Edges", color="tab:blue")
-  axes[0].tick_params(axis="y", labelcolor="tab:blue")
-  axes[0].grid(True, linestyle="--", alpha=0.6)
-  axes[0].set_title(
-      "Financial Correlation Network - Comprehensive Global Metrics"
-  )
+        degree_cent = nx.degree_centrality(G)
+        # Betweenness uses shortest paths, so it needs distance
+        betweenness_cent = nx.betweenness_centrality(G, weight="distance")
+        # PageRank needs strength, so it uses weight
+        pagerank_cent = nx.pagerank(G, weight="weight")
 
-  # 2. Network Density
-  axes[1].plot(
-      df["Date"], df["Density"], color="tab:red", marker="s", label="Density"
-  )
-  axes[1].set_ylabel("Density", color="tab:red")
-  axes[1].tick_params(axis="y", labelcolor="tab:red")
-  axes[1].grid(True, linestyle="--", alpha=0.6)
+        for node in G.nodes():
+            rows.append({
+                "Month": window_date,
+                "Asset": node,
+                "Degree_Centrality": degree_cent[node],
+                "Betweenness_Centrality": betweenness_cent[node],
+                "PageRank": pagerank_cent[node],
+            })
 
-  # 3. Modularity and Number of Communities
-  ax3_twin = axes[2].twinx()
-  axes[2].plot(
-      df["Date"],
-      df["Modularity"],
-      color="tab:green",
-      marker="^",
-      label="Modularity",
-  )
-  ax3_twin.plot(
-      df["Date"],
-      df["Num_Communities"],
-      color="tab:purple",
-      linestyle="--",
-      marker="x",
-      label="Communities",
-  )
-  axes[2].set_ylabel("Modularity", color="tab:green")
-  ax3_twin.set_ylabel("Communities Count", color="tab:purple")
-  axes[2].tick_params(axis="y", labelcolor="tab:green")
-  ax3_twin.tick_params(axis="y", labelcolor="tab:purple")
-  axes[2].grid(True, linestyle="--", alpha=0.6)
+    pd.DataFrame(rows).to_csv(folder / "nodes_centrality_timeseries.csv", index=False)
+    print(f"[{group}] Node metrics saved.")
 
-  # 4. Clustering Coefficient and Path Length
-  axes[3].plot(
-      df["Date"],
-      df["Clustering_Coefficient"],
-      color="tab:orange",
-      marker="d",
-      label="Clustering",
-  )
-  axes[3].set_xlabel("Date")
-  axes[3].set_ylabel("Clustering Coeff", color="tab:orange")
-  axes[3].tick_params(axis="y", labelcolor="tab:orange")
-  axes[3].grid(True, linestyle="--", alpha=0.6)
 
-  # 5. Bitcoin and S&P 500, each rebased to 100 at its first available price.
-  levels_file = PROJECT_DIR / "data/normalized/merged_levels.csv"
-  if levels_file.exists():
-    levels_df = pd.read_csv(levels_file, parse_dates=["date"]).sort_values("date")
-    market_columns = {
-        "crypto__BTC": "Bitcoin",
-        "market_indices__SPX": "S&P 500",
-    }
-    for column, label in market_columns.items():
-      if column not in levels_df.columns:
-        continue
-      prices = pd.to_numeric(levels_df[column], errors="coerce")
-      first_valid = prices.dropna()
-      if first_valid.empty or first_valid.iloc[0] == 0:
-        continue
-      normalized_prices = prices / first_valid.iloc[0] * 100
-      axes[4].plot(levels_df["date"], normalized_prices, label=label)
+def generate_global_metrics(group):
+    folder = graph_dir(group)
+    dates = window_dates(folder)
 
-    if axes[4].lines:
-      axes[4].legend()
+    if not dates:
+        print(f"[{group}] No graph files found. Run generate_graph_date first.")
+        return
+
+    global_metrics = []
+
+    for window_date in dates:
+        G = load_window_graph(folder, window_date)
+
+        if len(G.nodes) == 0:
+            continue
+
+        density = nx.density(G)
+        clustering = nx.average_clustering(G, weight="weight")
+
+        # Path length is measured on the largest connected part only
+        largest_cc = max(nx.connected_components(G), key=len)
+        largest_fraction = len(largest_cc) / len(G.nodes)
+        subgraph = G.subgraph(largest_cc)
+        if len(subgraph) > 1:
+            path_length = nx.average_shortest_path_length(subgraph, weight="distance")
+        else:
+            path_length = 0.0
+
+        # Communities are found only on nodes that have at least one edge
+        connected_nodes = [n for n in G.nodes() if G.degree(n) > 0]
+        if len(connected_nodes) > 0:
+            core = G.subgraph(connected_nodes)
+            communities = nx.community.greedy_modularity_communities(core, weight="weight")
+            num_communities = len(communities)
+            modularity = nx.community.modularity(core, communities, weight="weight")
+        else:
+            num_communities = 0
+            modularity = 0.0
+
+        global_metrics.append({
+            "Date": window_date,
+            "Nodes_Count": len(G.nodes),
+            "Edges_Count": len(G.edges),
+            "Density": density,
+            "Clustering_Coefficient": clustering,
+            "Avg_Path_Length": path_length,
+            "Largest_Component_Fraction": largest_fraction,
+            "Modularity": modularity,
+            "Num_Communities": num_communities,
+        })
+
+    output_file = folder / "global_network_metrics.csv"
+    pd.DataFrame(global_metrics).to_csv(output_file, index=False)
+    print(f"[{group}] Global metrics saved to: {output_file}")
+
+
+def plot_all_global_metrics(group):
+    metrics_file = graph_dir(group) / "global_network_metrics.csv"
+
+    if not metrics_file.exists():
+        print(f"Metrics file not found at: {metrics_file}")
+        return
+
+    df = pd.read_csv(metrics_file)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date")
+
+    fig, axes = plt.subplots(nrows=5, ncols=1, figsize=(12, 17), sharex=True)
+
+    # 1. Edges
+    axes[0].plot(df["Date"], df["Edges_Count"], color="tab:blue", marker="o")
+    axes[0].set_ylabel("Edges", color="tab:blue")
+    axes[0].tick_params(axis="y", labelcolor="tab:blue")
+    axes[0].set_title(f"Financial Correlation Network ({group}) - Global Metrics")
+
+    # 2. Density
+    axes[1].plot(df["Date"], df["Density"], color="tab:red", marker="s")
+    axes[1].set_ylabel("Density", color="tab:red")
+    axes[1].tick_params(axis="y", labelcolor="tab:red")
+
+    # 3. Modularity and number of communities
+    ax3_twin = axes[2].twinx()
+    axes[2].plot(df["Date"], df["Modularity"], color="tab:green", marker="^")
+    ax3_twin.plot(df["Date"], df["Num_Communities"], color="tab:purple",
+                  linestyle="--", marker="x")
+    axes[2].set_ylabel("Modularity", color="tab:green")
+    ax3_twin.set_ylabel("Communities Count", color="tab:purple")
+    axes[2].tick_params(axis="y", labelcolor="tab:green")
+    ax3_twin.tick_params(axis="y", labelcolor="tab:purple")
+
+    # 4. Clustering and average path length
+    ax4_twin = axes[3].twinx()
+    axes[3].plot(df["Date"], df["Clustering_Coefficient"], color="tab:orange", marker="d")
+    ax4_twin.plot(df["Date"], df["Avg_Path_Length"], color="tab:brown",
+                  linestyle="--", marker="x")
+    axes[3].set_ylabel("Clustering Coeff", color="tab:orange")
+    ax4_twin.set_ylabel("Avg Path Length", color="tab:brown")
+    axes[3].tick_params(axis="y", labelcolor="tab:orange")
+    ax4_twin.tick_params(axis="y", labelcolor="tab:brown")
+
+    # 5. Bitcoin and S&P 500, both start at 100
+    levels_file = DEFAULT_OUTPUT_DIR / "merged_levels.csv"
+    if levels_file.exists():
+        levels_df = pd.read_csv(levels_file, parse_dates=["date"]).sort_values("date")
+        market_columns = {
+            "crypto__BTC": "Bitcoin",
+            "market_indices__SPX": "S&P 500",
+        }
+        for column, label in market_columns.items():
+            if column not in levels_df.columns:
+                continue
+            prices = pd.to_numeric(levels_df[column], errors="coerce")
+            first_valid = prices.dropna()
+            if first_valid.empty or first_valid.iloc[0] == 0:
+                continue
+            axes[4].plot(levels_df["date"], prices / first_valid.iloc[0] * 100, label=label)
+
+        if axes[4].lines:
+            axes[4].legend()
+        else:
+            axes[4].text(0.5, 0.5, "Bitcoin and S&P 500 price data unavailable",
+                         ha="center", va="center", transform=axes[4].transAxes)
     else:
-      axes[4].text(
-          0.5, 0.5, "Bitcoin and S&P 500 price data unavailable",
-          ha="center", va="center", transform=axes[4].transAxes,
-      )
-  else:
-    axes[4].text(
-        0.5, 0.5, f"Price data file not found: {levels_file}",
-        ha="center", va="center", transform=axes[4].transAxes,
-    )
-  axes[4].set_ylabel("Index (base = 100)")
-  axes[4].set_xlabel("Date")
-  axes[4].grid(True, linestyle="--", alpha=0.6)
-  axes[4].set_title("Bitcoin and S&P 500 (Normalized)")
+        axes[4].text(0.5, 0.5, f"Price data file not found: {levels_file}",
+                     ha="center", va="center", transform=axes[4].transAxes)
+    axes[4].set_ylabel("Index (base = 100)")
+    axes[4].set_xlabel("Date")
+    axes[4].set_title("Bitcoin and S&P 500 (Normalized)")
 
-  plt.tight_layout()
+    for ax in axes:
+        ax.grid(True, linestyle="--", alpha=0.6)
 
-  output_path = (
-      PROJECT_DIR / f"data/visualizations/{filter_name}_comprehensive_global_metrics.png"
-  )
-  output_path.parent.mkdir(parents=True, exist_ok=True)
-  plt.savefig(output_path, dpi=300)
-  plt.close()
-  print(f"Comprehensive metrics plot saved successfully to: {output_path}")
+    plt.tight_layout()
+
+    output_path = PROJECT_DIR / f"data/visualizations/{group}_comprehensive_global_metrics.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Plot saved to: {output_path}")
+
+
+def load_group_averages(group):
+    csv_file = graph_dir(group) / "nodes_centrality_timeseries.csv"
+    if not csv_file.exists():
+        print(f"File not found: {csv_file}")
+        return None
+
+    df = pd.read_csv(csv_file)
+
+    # Remove indices and macro data, we only compare real assets
+    df = df[~df["Asset"].str.startswith(("market_indices__", "macro_indicators__"))]
+
+    # Every asset is in every window (isolated nodes are kept), so a simple mean is fine
+    return df.groupby("Asset")[["Degree_Centrality", "PageRank", "Betweenness_Centrality"]].mean()
 
 
 def compare_local_centrality_insights(top_n=3):
-    csv_file = PROJECT_DIR / "data/graph" / "nodes_centrality_timeseries.csv"
-    if not csv_file.exists():
-        print(f"File not found: {csv_file}")
+    # Each market is analyzed in its own network
+    tradfi = load_group_averages("non_crypto")
+    crypto = load_group_averages("crypto_only")
+    if tradfi is None or crypto is None:
         return
 
-    df = pd.read_csv(csv_file)
-    df = df[~df["Asset"].str.startswith(("market_indices__", "macro_indicators__"))]
-
-    # Average per asset across time
-    avg = df.groupby("Asset")[["Degree_Centrality", "PageRank", "Betweenness_Centrality"]].mean()
-    crypto = avg[avg.index.str.startswith("crypto_")]
-    tradfi = avg[~avg.index.str.startswith("crypto_")]
-
-    # 1. Degree dispersion
+    # 1. Degree: average level and spread
+    # Degree is divided by (n-1) of each network, so compare it with care
     _, p = stats.levene(tradfi["Degree_Centrality"], crypto["Degree_Centrality"])
-    print("1. Degree Std: TradFi=%.4f, Crypto=%.4f (Levene p=%.2f -> %s)" % (
+    print("1. Degree")
+    print("   Mean: TradFi=%.4f, Crypto=%.4f" % (
+        tradfi["Degree_Centrality"].mean(), crypto["Degree_Centrality"].mean()))
+    print("   Std : TradFi=%.4f, Crypto=%.4f (Levene p=%.2f -> %s)" % (
         tradfi["Degree_Centrality"].std(),
         crypto["Degree_Centrality"].std(),
         p,
-        "similar" if p >= 0.05 else "different",
+        "similar spread" if p >= 0.05 else "different spread",
     ))
 
     # 2. Top drivers and 3. Top bridges
-    for title, col in [("2. Top PageRank", "PageRank"), ("3. Top Betweenness", "Betweenness_Centrality")]:
+    for title, col in [("2. Top PageRank", "PageRank"),
+                       ("3. Top Betweenness", "Betweenness_Centrality")]:
         print(f"\n{title}:")
         print("  TradFi:", ", ".join(tradfi[col].nlargest(top_n).index))
         print("  Crypto:", ", ".join(crypto[col].nlargest(top_n).index))
         print(f"  Mean: TradFi={tradfi[col].mean():.4f}, Crypto={crypto[col].mean():.4f}")
 
+
 if __name__ == '__main__':
-    recalculate = False
+    recalculate = True
     if recalculate:
-        generate_graph_date()
-        analyze_graph(None)  # Pass None since we are reading from files
-        generate_global_metrics()
-    plot_all_global_metrics()
+        for group in GROUPS:
+            generate_graph_date(group)
+            analyze_graph(group)
+            generate_global_metrics(group)
+
+    for group in GROUPS:
+        plot_all_global_metrics(group)
 
     compare_local_centrality_insights()
-
